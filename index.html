@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>aupa — particle visualizer</title>
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: #000;
+        overflow: hidden;
+      }
+      canvas {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+      }
+      #fallback {
+        position: fixed;
+        inset: 0;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        color: #f88;
+        font-family: ui-monospace, SFMono-Regular, monospace;
+        font-size: 14px;
+        text-align: center;
+        padding: 2rem;
+      }
+      #fallback.show { display: flex; }
+      #stats {
+        position: fixed;
+        top: 8px;
+        left: 8px;
+        color: #8f8;
+        font-family: ui-monospace, SFMono-Regular, monospace;
+        font-size: 12px;
+        opacity: 0.6;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+    <div id="stats"></div>
+    <div id="fallback"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
