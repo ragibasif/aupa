@@ -4,6 +4,24 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>aupa — particle visualizer</title>
+
+    <meta name="description" content="One million GPU-driven particles, cyclical Big Bangs, real-time multi-attractor physics. Built with WebGPU." />
+    <meta name="theme-color" content="#000000" />
+
+    <meta property="og:title" content="aupa" />
+    <meta property="og:description" content="1M particles. Click to attract, right-click to anchor wells, watch universes form and erupt." />
+    <meta property="og:type" content="website" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="aupa" />
+    <meta name="twitter:description" content="1M particles. Click to attract, right-click to anchor wells, watch universes form and erupt." />
+
+    <!-- Drop a favorite screenshot at public/og.png (1200×630 ideal) for
+         link previews to look good on Twitter, Slack, iMessage, etc. -->
+    <meta property="og:image" content="/og.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta name="twitter:image" content="/og.png" />
     <style>
       html, body {
         margin: 0;
@@ -16,6 +34,8 @@
         display: block;
         width: 100vw;
         height: 100vh;
+        /* Disable browser pinch-zoom and pull-to-refresh so our gestures aren't hijacked. */
+        touch-action: none;
       }
       #fallback {
         position: fixed;
@@ -60,12 +80,42 @@
         user-select: none;
       }
       #config h3 {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
         margin: 0 0 12px;
         font-size: 10px;
         font-weight: 500;
         letter-spacing: 0.16em;
         text-transform: uppercase;
-        opacity: 0.5;
+        opacity: 0.55;
+        cursor: pointer;
+        user-select: none;
+      }
+      #config h3:hover { opacity: 0.8; }
+      .cfg-chevron {
+        font-size: 14px;
+        line-height: 1;
+        opacity: 0.7;
+      }
+      .cfg-chevron::before { content: '−'; }
+      #config.collapsed .cfg-chevron::before { content: '+'; }
+      #config.collapsed > *:not(h3) { display: none; }
+      #config.collapsed h3 { margin: 0; }
+
+      @media (max-width: 600px) {
+        #config {
+          top: 8px;
+          right: 8px;
+          width: 180px;
+          padding: 10px 12px 10px;
+        }
+        #config h3 { font-size: 9px; margin-bottom: 10px; }
+        .cfg-row { margin-bottom: 8px; }
+        .cfg-label { font-size: 9px; }
+        .cfg-button { font-size: 9px; padding: 6px; }
+        .cfg-preset { font-size: 8px; padding: 4px 0; }
+        .cfg-hint { font-size: 8px; }
       }
       .cfg-row { margin-bottom: 10px; }
       .cfg-label {
@@ -135,6 +185,42 @@
       .cfg-button:active {
         background: rgba(255, 255, 255, 0.18);
       }
+      .cfg-button + .cfg-button {
+        margin-top: 4px;
+      }
+      .cfg-hint {
+        margin-top: 12px;
+        font-size: 9px;
+        letter-spacing: 0.05em;
+        text-align: center;
+        opacity: 0.4;
+        line-height: 1.5;
+      }
+      .cfg-preset-row {
+        display: flex;
+        gap: 4px;
+        margin: 0 0 14px;
+      }
+      .cfg-preset {
+        flex: 1;
+        padding: 5px 0;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 3px;
+        color: rgba(255, 255, 255, 0.65);
+        font-family: inherit;
+        font-size: 9px;
+        letter-spacing: 0.04em;
+        cursor: pointer;
+        transition: background 80ms ease, color 80ms ease;
+      }
+      .cfg-preset:hover {
+        background: rgba(255, 255, 255, 0.12);
+        color: rgba(255, 255, 255, 0.95);
+      }
+      .cfg-preset:active {
+        background: rgba(255, 255, 255, 0.2);
+      }
     </style>
   </head>
   <body>
@@ -143,7 +229,18 @@
     <div id="fallback"></div>
 
     <div id="config">
-      <h3>controls</h3>
+      <h3>
+        <span>controls</span>
+        <span class="cfg-chevron"></span>
+      </h3>
+
+      <div class="cfg-preset-row">
+        <button class="cfg-preset" data-preset="dust">dust</button>
+        <button class="cfg-preset" data-preset="galaxy">galaxy</button>
+        <button class="cfg-preset" data-preset="nova">nova</button>
+        <button class="cfg-preset" data-preset="chaos">chaos</button>
+        <button class="cfg-preset" data-preset="calm">calm</button>
+      </div>
 
       <div class="cfg-row">
         <div class="cfg-label">
@@ -210,6 +307,15 @@
       </div>
 
       <button id="cfg-restart" class="cfg-button">restart universe</button>
+      <button id="cfg-clear-wells" class="cfg-button">clear gravity wells</button>
+      <button id="cfg-share" class="cfg-button">share this look</button>
+      <button id="cfg-screenshot" class="cfg-button">save screenshot</button>
+
+      <div class="cfg-hint">
+        desktop: drag orbit · scroll zoom · right-click well<br />
+        touch: 1-finger cursor · 2-finger orbit/pinch · double-tap well<br />
+        press <b>h</b> to hide ui
+      </div>
     </div>
 
     <script type="module" src="/src/main.ts"></script>

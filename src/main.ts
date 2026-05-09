@@ -21,6 +21,44 @@ const config = {
   bloom: 1.0,          // bloom contribution multiplier (0 = off, 1 = standard, 3 = blown out)
 };
 
+// Shareable-URL encoding: compact `key=value` pairs in the URL hash.
+// Keys are 1-2 chars to keep the URL short.
+const SHARE_KEYS: ReadonlyArray<readonly [string, keyof typeof config]> = [
+  ['g',  'gravity'],
+  ['d',  'drag'],
+  ['t',  'trailDecay'],
+  ['ps', 'particleSize'],
+  ['gl', 'particleGlow'],
+  ['b',  'bloom'],
+  ['bp', 'boomPeak'],
+  ['bt', 'boomTrigger'],
+];
+
+function configToHash(): string {
+  const parts: string[] = [];
+  for (const [short, full] of SHARE_KEYS) {
+    // Trim trailing zeros for readability: 0.93000 → 0.93
+    const trimmed = parseFloat(config[full].toFixed(4)).toString();
+    parts.push(`${short}=${trimmed}`);
+  }
+  return parts.join('&');
+}
+
+// Read the URL hash on load and overwrite matching config keys.
+{
+  const hash = window.location.hash.slice(1);
+  if (hash) {
+    const params = new URLSearchParams(hash);
+    for (const [short, full] of SHARE_KEYS) {
+      const v = params.get(short);
+      if (v !== null) {
+        const n = parseFloat(v);
+        if (Number.isFinite(n)) config[full] = n;
+      }
+    }
+  }
+}
+
 // Hard-coded — these aren't worth surfacing in the UI.
 const SLOW_FPS   = 45;  // FPS threshold; below this, pressure accumulates faster
 const BOOM_DECAY = 5;   // exponential decay rate of the boom impulse per second
@@ -51,6 +89,11 @@ async function main() {
   const ctx = canvas.getContext('webgpu')!;
   const format = navigator.gpu.getPreferredCanvasFormat();
 
+  // Internal pipeline runs in HDR. Trail and bloom textures use 16-bit
+  // float so additive blending can push values above 1.0; ACES in the
+  // composite pass then maps everything back to the canvas's 8-bit range.
+  const HDR_FORMAT: GPUTextureFormat = 'rgba16float';
+
   // Persistent texture that accumulates particle draws across frames.
   // The composite pass samples this and writes to the swapchain with a
   // vignette, so the trail needs TEXTURE_BINDING usage.
@@ -72,7 +115,7 @@ async function main() {
     trailTexture = device.createTexture({
       label: 'trail',
       size: { width: canvas.width, height: canvas.height },
-      format,
+      format: HDR_FORMAT,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     // Bloom textures are half-res — bloom is intrinsically blurry, so
@@ -84,13 +127,13 @@ async function main() {
     bloomTextureA = device.createTexture({
       label: 'bloom-a',
       size: { width: bw, height: bh },
-      format,
+      format: HDR_FORMAT,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     bloomTextureB = device.createTexture({
       label: 'bloom-b',
       size: { width: bw, height: bh },
-      format,
+      format: HDR_FORMAT,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     // Bind groups reference these textures, so all of them are stale.
@@ -104,11 +147,173 @@ async function main() {
 
   // Mouse cursor in normalized device coords [-1, 1]. y is flipped so up is +y.
   const mouseNdc: [number, number] = [0, 0];
+
+  // Manual orbit camera. Drag to rotate, scroll to zoom.
+  const camera = {
+    yaw: 0.4,
+    pitch: 0.25,
+    radius: 3,
+  };
+  let dragging = false;
+  let lastDragX = 0;
+  let lastDragY = 0;
+
+  // Persistent gravity wells dropped via right-click. Up to MAX_WELLS.
+  const MAX_WELLS = 8;
+  const wells: Array<[number, number, number]> = [];
+
+  canvas.addEventListener('mousedown', (e) => {
+    if (e.button === 0) {
+      dragging = true;
+      lastDragX = e.clientX;
+      lastDragY = e.clientY;
+      canvas.style.cursor = 'grabbing';
+    }
+  });
+  window.addEventListener('mouseup', (e) => {
+    if (e.button === 0 && dragging) {
+      dragging = false;
+      canvas.style.cursor = '';
+    }
+  });
   canvas.addEventListener('mousemove', (e) => {
     const rect = canvas.getBoundingClientRect();
+    if (dragging) {
+      const dx = e.clientX - lastDragX;
+      const dy = e.clientY - lastDragY;
+      camera.yaw -= dx * 0.005;
+      camera.pitch = Math.max(-1.4, Math.min(1.4, camera.pitch + dy * 0.005));
+      lastDragX = e.clientX;
+      lastDragY = e.clientY;
+    }
+    // Cursor NDC always updates so the gravity well still tracks the mouse,
+    // even while orbiting.
     mouseNdc[0] =  ((e.clientX - rect.left) / rect.width)  * 2 - 1;
     mouseNdc[1] = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
   });
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const factor = e.deltaY > 0 ? 1.1 : 1 / 1.1;
+    camera.radius = Math.max(1.2, Math.min(8, camera.radius * factor));
+  }, { passive: false });
+  canvas.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    if (wells.length < MAX_WELLS) {
+      wells.push([mouseWorld[0], mouseWorld[1], mouseWorld[2]]);
+    }
+  });
+
+  // ── Touch input ────────────────────────────────────────────────────
+  // 1 finger = cursor (gravity well), 2 fingers = orbit + pinch zoom,
+  // double-tap = drop persistent gravity well.
+  let touchMidX = 0;
+  let touchMidY = 0;
+  let lastPinchDist = 0;
+  let touchStartTime = 0;
+  let touchStartX = 0;
+  let touchStartY = 0;
+  let lastTapTime = 0;
+
+  function setCursorFromClient(clientX: number, clientY: number) {
+    const rect = canvas.getBoundingClientRect();
+    mouseNdc[0] =  ((clientX - rect.left) / rect.width)  * 2 - 1;
+    mouseNdc[1] = -(((clientY - rect.top) / rect.height) * 2 - 1);
+  }
+
+  canvas.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      touchStartTime = performance.now();
+      touchStartX = t.clientX;
+      touchStartY = t.clientY;
+      setCursorFromClient(t.clientX, t.clientY);
+    } else if (e.touches.length === 2) {
+      const a = e.touches[0];
+      const b = e.touches[1];
+      touchMidX = (a.clientX + b.clientX) / 2;
+      touchMidY = (a.clientY + b.clientY) / 2;
+      const dx = b.clientX - a.clientX;
+      const dy = b.clientY - a.clientY;
+      lastPinchDist = Math.sqrt(dx * dx + dy * dy);
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      setCursorFromClient(t.clientX, t.clientY);
+    } else if (e.touches.length === 2) {
+      const a = e.touches[0];
+      const b = e.touches[1];
+      // Pinch: relative distance change → camera radius
+      const dx = b.clientX - a.clientX;
+      const dy = b.clientY - a.clientY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (lastPinchDist > 0 && dist > 0) {
+        const factor = lastPinchDist / dist;
+        camera.radius = Math.max(1.2, Math.min(8, camera.radius * factor));
+      }
+      lastPinchDist = dist;
+      // Orbit: midpoint motion → yaw/pitch
+      const mx = (a.clientX + b.clientX) / 2;
+      const my = (a.clientY + b.clientY) / 2;
+      camera.yaw -= (mx - touchMidX) * 0.005;
+      camera.pitch = Math.max(-1.4, Math.min(1.4, camera.pitch + (my - touchMidY) * 0.005));
+      touchMidX = mx;
+      touchMidY = my;
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchend', (e) => {
+    if (e.touches.length === 0) {
+      // Final touch lifted — check whether this was a tap (short, no movement)
+      const ct = e.changedTouches[0];
+      if (ct) {
+        const duration = performance.now() - touchStartTime;
+        const dx = ct.clientX - touchStartX;
+        const dy = ct.clientY - touchStartY;
+        const moved = Math.sqrt(dx * dx + dy * dy);
+        if (duration < 300 && moved < 10) {
+          const now = performance.now();
+          if (now - lastTapTime < 300) {
+            // Double-tap: drop a persistent well at the cursor position
+            if (wells.length < MAX_WELLS) {
+              wells.push([mouseWorld[0], mouseWorld[1], mouseWorld[2]]);
+            }
+            lastTapTime = 0;
+          } else {
+            lastTapTime = now;
+          }
+        }
+      }
+      lastPinchDist = 0;
+    } else if (e.touches.length === 1) {
+      // Lifted from 2 to 1 — reset pinch state so we don't see a huge delta
+      lastPinchDist = 0;
+    }
+  }, { passive: false });
+
+  // H key toggles the config panel — useful for clean screenshots and
+  // mobile real estate.
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'h' || e.key === 'H') {
+      const cfg = document.getElementById('config');
+      if (cfg) cfg.style.display = cfg.style.display === 'none' ? '' : 'none';
+    }
+  });
+
+  // Click the panel header to collapse/expand. Default to collapsed on
+  // narrow viewports so the panel doesn't dominate phone screens.
+  const configEl = document.getElementById('config');
+  const configHeader = configEl?.querySelector('h3');
+  configHeader?.addEventListener('click', () => {
+    configEl?.classList.toggle('collapsed');
+  });
+  if (window.matchMedia('(max-width: 600px)').matches) {
+    configEl?.classList.add('collapsed');
+  }
 
   // ── Particle storage. Lives entirely on the GPU. ───────────────────
   const particleBuffer = device.createBuffer({
@@ -121,6 +326,18 @@ async function main() {
   const updateUniforms = device.createBuffer({
     label: 'update-uniforms',
     size: 32,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  // Wells uniform: { count: u32, _pad×3, vec4<f32>×8 } = 144 bytes.
+  // Two TypedArray views over the same ArrayBuffer let us write a u32
+  // header alongside f32 data without extra encoding.
+  const wellsBytes = new ArrayBuffer(16 + 8 * 16);
+  const wellsCountView = new Uint32Array(wellsBytes, 0, 4);
+  const wellsDataView  = new Float32Array(wellsBytes, 16, 8 * 4);
+  const wellsBuffer = device.createBuffer({
+    label: 'wells',
+    size: wellsBytes.byteLength,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -199,6 +416,7 @@ async function main() {
     entries: [
       { binding: 0, resource: { buffer: particleBuffer } },
       { binding: 1, resource: { buffer: updateUniforms } },
+      { binding: 2, resource: { buffer: wellsBuffer } },
     ],
   });
 
@@ -214,7 +432,7 @@ async function main() {
       entryPoint: 'fs',
       targets: [
         {
-          format,
+          format: HDR_FORMAT,
           blend: {
             color: { srcFactor: 'src-alpha', dstFactor: 'one', operation: 'add' },
             alpha: { srcFactor: 'one',       dstFactor: 'one', operation: 'add' },
@@ -247,7 +465,7 @@ async function main() {
       entryPoint: 'fs',
       targets: [
         {
-          format,
+          format: HDR_FORMAT,
           // dst.rgb = 0 * src.rgb + constant.rgb * dst.rgb  → fades existing pixels
           // dst.a   = 0 * src.a   + 1        * dst.a       → leaves alpha alone
           blend: {
@@ -269,7 +487,7 @@ async function main() {
     fragment: {
       module: bloomModule,
       entryPoint: 'fs',
-      targets: [{ format }],
+      targets: [{ format: HDR_FORMAT }],
     },
     primitive: { topology: 'triangle-list' },
   });
@@ -305,12 +523,18 @@ async function main() {
   // Reused upload buffer for update uniforms. 8 floats = 32 bytes.
   const uniformsArray = new Float32Array(8);
 
-  function updateCamera(t: number) {
+  function updateCamera() {
     const aspect = canvas.width / canvas.height || 1;
     const fovY = Math.PI / 3;
-    const r = 3.0;
+    const r = camera.radius;
 
-    vec3.set(camPos, r * Math.sin(t * 0.2), 0.6, r * Math.cos(t * 0.2));
+    // Spherical → Cartesian. yaw rotates in the XZ plane (around world Y),
+    // pitch lifts the camera vertically.
+    vec3.set(camPos,
+      r * Math.cos(camera.pitch) * Math.sin(camera.yaw),
+      r * Math.sin(camera.pitch),
+      r * Math.cos(camera.pitch) * Math.cos(camera.yaw),
+    );
     mat4.perspective(proj, fovY, aspect, 0.1, 100);
     mat4.lookAt(view, camPos as Float32Array, [0, 0, 0], [0, 1, 0]);
     mat4.multiply(vp, proj, view);
@@ -329,27 +553,77 @@ async function main() {
   }
 
   // ── Config panel wiring ───────────────────────────────────────────
+  // Each slider registers a sync function. When a preset mutates `config`,
+  // we walk these to push the new values back into the DOM.
+  const sliderSyncs: Array<() => void> = [];
   function bindSlider(
     id: string,
+    get: () => number,
     set: (v: number) => void,
     fmt: (v: number) => string,
   ) {
     const input = document.getElementById(id) as HTMLInputElement;
     const valueLabel = document.getElementById(id + '-val') as HTMLSpanElement;
+    function sync() {
+      const v = get();
+      input.value = String(v);
+      valueLabel.textContent = fmt(v);
+    }
+    sync();
     input.addEventListener('input', () => {
       const v = parseFloat(input.value);
       set(v);
       valueLabel.textContent = fmt(v);
     });
+    sliderSyncs.push(sync);
   }
-  bindSlider('cfg-gravity',      v => { config.gravity      = v; }, v => v.toFixed(2));
-  bindSlider('cfg-drag',         v => { config.drag         = v; }, v => v.toFixed(2));
-  bindSlider('cfg-trail',        v => { config.trailDecay   = v; }, v => v.toFixed(2));
-  bindSlider('cfg-particlesize', v => { config.particleSize = v; }, v => v.toFixed(3));
-  bindSlider('cfg-glow',         v => { config.particleGlow = v; }, v => v.toFixed(2));
-  bindSlider('cfg-bloom',        v => { config.bloom        = v; }, v => v.toFixed(2));
-  bindSlider('cfg-boompeak',     v => { config.boomPeak     = v; }, v => v.toFixed(0));
-  bindSlider('cfg-boomtrigger',  v => { config.boomTrigger  = v; }, v => v.toFixed(1));
+  bindSlider('cfg-gravity',      () => config.gravity,      v => { config.gravity      = v; }, v => v.toFixed(2));
+  bindSlider('cfg-drag',         () => config.drag,         v => { config.drag         = v; }, v => v.toFixed(2));
+  bindSlider('cfg-trail',        () => config.trailDecay,   v => { config.trailDecay   = v; }, v => v.toFixed(2));
+  bindSlider('cfg-particlesize', () => config.particleSize, v => { config.particleSize = v; }, v => v.toFixed(3));
+  bindSlider('cfg-glow',         () => config.particleGlow, v => { config.particleGlow = v; }, v => v.toFixed(2));
+  bindSlider('cfg-bloom',        () => config.bloom,        v => { config.bloom        = v; }, v => v.toFixed(2));
+  bindSlider('cfg-boompeak',     () => config.boomPeak,     v => { config.boomPeak     = v; }, v => v.toFixed(0));
+  bindSlider('cfg-boomtrigger',  () => config.boomTrigger,  v => { config.boomTrigger  = v; }, v => v.toFixed(1));
+
+  // ── Presets: snap all sliders at once ─────────────────────────────
+  const presets: Record<string, Partial<typeof config>> = {
+    dust: {
+      gravity: 0.5, drag: 0.2, trailDecay: 0.97,
+      particleSize: 0.014, particleGlow: 0.5, bloom: 1.5,
+      boomPeak: 50, boomTrigger: 10,
+    },
+    galaxy: {
+      gravity: 1.8, drag: 0.05, trailDecay: 0.96,
+      particleSize: 0.008, particleGlow: 0.4, bloom: 1.0,
+      boomPeak: 80, boomTrigger: 6,
+    },
+    nova: {
+      gravity: 3.5, drag: 0.4, trailDecay: 0.95,
+      particleSize: 0.014, particleGlow: 0.7, bloom: 2.5,
+      boomPeak: 180, boomTrigger: 3,
+    },
+    chaos: {
+      gravity: 5.0, drag: 0.05, trailDecay: 0.92,
+      particleSize: 0.006, particleGlow: 0.4, bloom: 1.2,
+      boomPeak: 120, boomTrigger: 2.5,
+    },
+    calm: {
+      gravity: 0.8, drag: 1.0, trailDecay: 0.85,
+      particleSize: 0.008, particleGlow: 0.25, bloom: 0.6,
+      boomPeak: 50, boomTrigger: 18,
+    },
+  };
+  document.querySelectorAll<HTMLButtonElement>('.cfg-preset').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const name = btn.dataset.preset;
+      if (!name) return;
+      const p = presets[name];
+      if (!p) return;
+      Object.assign(config, p);
+      for (const sync of sliderSyncs) sync();
+    });
+  });
 
   // Restart button: re-run the init compute pass to reseed all particle
   // positions and velocities, and clear the trail texture for a fresh start.
@@ -364,6 +638,37 @@ async function main() {
     trailNeedsInit = true;
     boomStrength = 0;
     pressureTime = 0;
+  });
+
+  // Clear wells button: remove all persistent gravity wells.
+  document.getElementById('cfg-clear-wells')!.addEventListener('click', () => {
+    wells.length = 0;
+  });
+
+  // Screenshot button: captures the canvas as PNG. Flag is consumed in
+  // the frame loop, where toBlob() runs immediately after submit() —
+  // catching the canvas's drawing buffer before the browser presents it.
+  let pendingScreenshot = false;
+  document.getElementById('cfg-screenshot')!.addEventListener('click', () => {
+    pendingScreenshot = true;
+  });
+
+  // Share button: encode current slider state into the URL hash and
+  // copy the shareable link to the clipboard.
+  document.getElementById('cfg-share')!.addEventListener('click', async () => {
+    const hash = configToHash();
+    history.replaceState(null, '', '#' + hash);
+    const url = `${window.location.origin}${window.location.pathname}#${hash}`;
+    const btn = document.getElementById('cfg-share') as HTMLButtonElement;
+    const originalText = btn.textContent;
+    try {
+      await navigator.clipboard.writeText(url);
+      btn.textContent = 'copied!';
+    } catch {
+      // Clipboard API needs HTTPS/localhost. Fallback: surface the URL.
+      window.prompt('copy this share url:', url);
+    }
+    setTimeout(() => { btn.textContent = originalText; }, 1200);
   });
 
   // ── Frame loop ─────────────────────────────────────────────────────
@@ -397,7 +702,7 @@ async function main() {
     boomStrength *= Math.exp(-BOOM_DECAY * dt);
     if (boomStrength < 0.1) boomStrength = 0;
 
-    updateCamera(t);
+    updateCamera();
     uniformsArray[0] = dt;
     uniformsArray[1] = config.gravity;
     uniformsArray[2] = config.drag;
@@ -428,6 +733,17 @@ async function main() {
 
     compositeArray[0] = config.bloom;
     device.queue.writeBuffer(compositeUniforms, 0, compositeArray);
+
+    // Pack persistent wells into the uniform buffer. count + xyz per well.
+    wellsCountView[0] = wells.length;
+    for (let i = 0; i < wells.length; i++) {
+      const base = i * 4;
+      wellsDataView[base + 0] = wells[i][0];
+      wellsDataView[base + 1] = wells[i][1];
+      wellsDataView[base + 2] = wells[i][2];
+      wellsDataView[base + 3] = 0;
+    }
+    device.queue.writeBuffer(wellsBuffer, 0, wellsBytes);
 
     // Lazy-create bind groups whenever they've been invalidated by a
     // texture resize.
@@ -574,6 +890,22 @@ async function main() {
     }
 
     device.queue.submit([enc.finish()]);
+
+    // Screenshot: capture immediately after submit, before the browser
+    // presents the canvas. toBlob is async; the snapshot is taken
+    // synchronously, encoding happens in the background.
+    if (pendingScreenshot) {
+      pendingScreenshot = false;
+      canvas.toBlob((blob) => {
+        if (!blob) return;
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.download = `aupa-${Date.now()}.png`;
+        link.href = url;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+      }, 'image/png');
+    }
 
     // FPS readout
     frames += 1;

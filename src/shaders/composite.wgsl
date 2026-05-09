@@ -33,17 +33,35 @@ fn vs(@builtin(vertex_index) vid: u32) -> VOut {
   return o;
 }
 
+// ACES filmic tonemap (Krzysztof Narkowicz fast approximation).
+// Maps potentially-HDR linear colors to a film-like [0,1] range with a
+// soft-shoulder highlight rolloff and gentle toe in the shadows.
+fn aces(x: vec3<f32>) -> vec3<f32> {
+  let a = 2.51;
+  let b = 0.03;
+  let c = 2.43;
+  let d = 0.59;
+  let e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e),
+               vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 @fragment
 fn fs(in: VOut) -> @location(0) vec4<f32> {
   let trail_color = textureSample(trail, samp, in.uv).rgb;
   let bloom_color = textureSample(bloom, samp, in.uv).rgb;
+
+  // Sum in HDR — values can exceed 1.0 here because trail and bloom
+  // textures are RGBA16Float.
   let combined = trail_color + bloom_color * u.bloom_strength;
+  let tonemapped = aces(combined);
 
   // Vignette: smooth darkening from a comfortable interior radius
-  // outward to the corners. *1.41 normalizes so corners hit ~1.0.
+  // outward to the corners. Applied AFTER tonemap so it isn't
+  // pulled back up by the curve.
   let centered = in.uv - 0.5;
   let dist = length(centered) * 1.41;
   let vignette = 1.0 - smoothstep(0.55, 1.1, dist);
 
-  return vec4<f32>(combined * vignette, 1.0);
+  return vec4<f32>(tonemapped * vignette, 1.0);
 }

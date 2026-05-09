@@ -21,8 +21,19 @@ struct Uniforms {
   mouse_world: vec4<f32>,
 };
 
+// Persistent gravity wells dropped by right-clicking. count is u32; data
+// is a fixed-size array because uniform buffers must have static layouts.
+struct Wells {
+  count: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+  data: array<vec4<f32>, 8>,
+};
+
 @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
 @group(0) @binding(1) var<uniform> u: Uniforms;
+@group(0) @binding(2) var<uniform> wells: Wells;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -60,7 +71,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // leaves normal-play dynamics untouched (gravity coefficient stays
   // far below 30) but defangs the singularity.
   let coeff = clamp((u.gravity - u.boom_strength) / r2, -30.0, 30.0);
-  let accel_main = dir_jitter * coeff;
+  var accel_main = dir_jitter * coeff;
+
+  // Sum forces from each persistent well. Same softened-gravity law as
+  // the cursor, but with no boom term — wells are stable attractors.
+  for (var k = 0u; k < wells.count; k = k + 1u) {
+    let to_well = wells.data[k].xyz - p.pos.xyz;
+    let r2_w = dot(to_well, to_well) + 0.01;
+    let dir_w = to_well * inverseSqrt(r2_w);
+    let coeff_w = clamp(u.gravity / r2_w, 0.0, 30.0);
+    accel_main = accel_main + dir_w * coeff_w;
+  }
 
   // Soft bounding sphere. Beyond `BOUND` units from the origin, a linear
   // restoring force kicks in — particles can be kicked outward, but the
