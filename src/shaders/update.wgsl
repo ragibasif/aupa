@@ -4,14 +4,20 @@ struct Particle {
 };
 
 struct Uniforms {
-  // dt = frame delta seconds
-  // mouse_world = cursor projected into world space (Sunday hookup)
-  // gravity = attraction strength toward mouse
-  // drag = velocity damping per second
+  // dt            = frame delta seconds
+  // gravity       = attraction strength toward mouse
+  // drag          = velocity damping per second
+  // boom_strength = repulsion strength; when > gravity, particles explode
+  //                 outward from the cursor. CPU drives this when sustained
+  //                 clustering tanks the framerate.
+  // mouse_world.xyz = cursor projected onto the focal plane
+  // mouse_world.w   = boom phase seed; held constant per boom event,
+  //                 randomized at each new boom so successive explosions
+  //                 scatter in different patterns.
   dt: f32,
   gravity: f32,
   drag: f32,
-  _pad: f32,
+  boom_strength: f32,
   mouse_world: vec4<f32>,
 };
 
@@ -25,15 +31,48 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   var p = particles[i];
 
-  // Softened-gravity attraction toward the cursor.
-  // r2 = |to_mouse|² + ε. The ε term is the Plummer softening length —
-  // it caps the force as a particle approaches the cursor, so nothing
-  // accelerates to infinity at the singularity. Try halving it for
-  // sharper slingshots, or doubling for a gentler swarm.
+  // Softened-gravity attraction toward the cursor, plus optional outward
+  // boom force. Net coefficient = gravity − boom_strength.
   let to_mouse = u.mouse_world.xyz - p.pos.xyz;
   let r2 = dot(to_mouse, to_mouse) + 0.01;
   let dir = to_mouse * inverseSqrt(r2);
-  let accel = dir * (u.gravity / r2);
+
+  // Per-particle pseudo-random unit-ish vector, parameterized by a phase
+  // that the CPU re-rolls on every boom. Same particle gets the same
+  // jitter for the duration of one boom (no flicker), but a different
+  // jitter on the next one (no two explosions look alike).
+  let phase = u.mouse_world.w;
+  let f_i = f32(i);
+  let jitter = vec3<f32>(
+    sin(f_i * 12.9898 + phase * 1.7),
+    sin(f_i * 78.2330 + phase * 2.3),
+    sin(f_i * 37.7190 + phase * 3.1),
+  );
+
+  // Blend jitter into the radial direction *only while the boom is active*.
+  // When boom_strength is 0 the perturbation vanishes and gravity stays
+  // perfectly radial — normal-play dynamics are untouched.
+  let perturb = clamp(u.boom_strength * 0.01, 0.0, 0.5);
+  let dir_jitter = normalize(dir + jitter * perturb);
+
+  // Cap the coefficient. Without this, particles at r² ≈ 0.01 during a
+  // boom get acceleration ~7800 — well past escape velocity. The clamp
+  // leaves normal-play dynamics untouched (gravity coefficient stays
+  // far below 30) but defangs the singularity.
+  let coeff = clamp((u.gravity - u.boom_strength) / r2, -30.0, 30.0);
+  let accel_main = dir_jitter * coeff;
+
+  // Soft bounding sphere. Beyond `BOUND` units from the origin, a linear
+  // restoring force kicks in — particles can be kicked outward, but the
+  // farther they go the harder they're pulled back. Without this, 1/r²
+  // gravity is too weak at distance for them to ever return.
+  const BOUND = 5.0;
+  const BOUND_K = 4.0;
+  let pos_len = length(p.pos.xyz) + 1e-4;
+  let overshoot = max(0.0, pos_len - BOUND);
+  let accel_bound = -p.pos.xyz * (overshoot * BOUND_K / pos_len);
+
+  let accel = accel_main + accel_bound;
 
   // Exponential drag — analytically correct for arbitrary dt and drag.
   let new_vel = p.vel.xyz * exp(-u.drag * u.dt) + accel * u.dt;

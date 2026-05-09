@@ -40,12 +40,154 @@
         opacity: 0.6;
         pointer-events: none;
       }
+
+      /* ── Config panel ──────────────────────────────────────────── */
+      #config {
+        position: fixed;
+        top: 12px;
+        right: 12px;
+        width: 220px;
+        padding: 14px 14px 12px;
+        background: rgba(10, 10, 16, 0.55);
+        backdrop-filter: blur(14px) saturate(1.4);
+        -webkit-backdrop-filter: blur(14px) saturate(1.4);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 8px;
+        font-family: ui-monospace, SFMono-Regular, monospace;
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.85);
+        z-index: 10;
+        user-select: none;
+      }
+      #config h3 {
+        margin: 0 0 12px;
+        font-size: 10px;
+        font-weight: 500;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        opacity: 0.5;
+      }
+      .cfg-row { margin-bottom: 10px; }
+      .cfg-label {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 4px;
+        font-size: 10px;
+        letter-spacing: 0.04em;
+      }
+      .cfg-label > span:first-child { opacity: 0.65; }
+      .cfg-label > span:last-child {
+        font-variant-numeric: tabular-nums;
+        opacity: 0.95;
+      }
+      #config input[type="range"] {
+        width: 100%;
+        -webkit-appearance: none;
+        appearance: none;
+        height: 2px;
+        background: rgba(255, 255, 255, 0.12);
+        border-radius: 1px;
+        margin: 0;
+        outline: none;
+        cursor: pointer;
+      }
+      #config input[type="range"]::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        appearance: none;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.9);
+        cursor: pointer;
+        border: none;
+        transition: transform 80ms ease;
+      }
+      #config input[type="range"]::-webkit-slider-thumb:hover {
+        transform: scale(1.2);
+      }
+      #config input[type="range"]::-moz-range-thumb {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.9);
+        cursor: pointer;
+        border: none;
+      }
+      .cfg-button {
+        width: 100%;
+        margin-top: 6px;
+        padding: 7px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 4px;
+        color: rgba(255, 255, 255, 0.75);
+        font-family: inherit;
+        font-size: 10px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        cursor: pointer;
+        transition: background 120ms ease, color 120ms ease;
+      }
+      .cfg-button:hover {
+        background: rgba(255, 255, 255, 0.1);
+        color: rgba(255, 255, 255, 0.95);
+      }
+      .cfg-button:active {
+        background: rgba(255, 255, 255, 0.18);
+      }
     </style>
   </head>
   <body>
     <canvas id="canvas"></canvas>
     <div id="stats"></div>
     <div id="fallback"></div>
+
+    <div id="config">
+      <h3>controls</h3>
+
+      <div class="cfg-row">
+        <div class="cfg-label">
+          <span>gravity</span>
+          <span id="cfg-gravity-val">2.00</span>
+        </div>
+        <input type="range" id="cfg-gravity" min="0" max="6" step="0.1" value="2.0" />
+      </div>
+
+      <div class="cfg-row">
+        <div class="cfg-label">
+          <span>drag</span>
+          <span id="cfg-drag-val">0.60</span>
+        </div>
+        <input type="range" id="cfg-drag" min="0" max="2" step="0.05" value="0.6" />
+      </div>
+
+      <div class="cfg-row">
+        <div class="cfg-label">
+          <span>trail length</span>
+          <span id="cfg-trail-val">0.93</span>
+        </div>
+        <input type="range" id="cfg-trail" min="0.5" max="0.99" step="0.01" value="0.93" />
+      </div>
+
+      <div class="cfg-row">
+        <div class="cfg-label">
+          <span>boom intensity</span>
+          <span id="cfg-boompeak-val">80</span>
+        </div>
+        <input type="range" id="cfg-boompeak" min="20" max="200" step="5" value="80" />
+      </div>
+
+      <div class="cfg-row">
+        <div class="cfg-label">
+          <span>boom interval</span>
+          <span id="cfg-boomtrigger-val">6.0</span>
+        </div>
+        <input type="range" id="cfg-boomtrigger" min="2" max="20" step="0.5" value="6" />
+      </div>
+
+      <button id="cfg-restart" class="cfg-button">restart universe</button>
+    </div>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
