@@ -1,9 +1,13 @@
-import { mat4 } from 'gl-matrix';
+import { mat4, vec3, vec4 } from 'gl-matrix';
 import initShaderCode from './shaders/init.wgsl?raw';
 import updateShaderCode from './shaders/update.wgsl?raw';
 import renderShaderCode from './shaders/render.wgsl?raw';
 
 const PARTICLE_COUNT = 1_000_000;
+
+// Physics tuning. Save and Vite hot-reloads — tweak live.
+const GRAVITY = 2.0;   // attraction strength toward the cursor
+const DRAG    = 0.6;   // velocity damping per second (exponential)
 
 // Each particle is two vec4<f32> = 32 bytes. Must match WGSL struct.
 const PARTICLE_BYTES = 32;
@@ -39,6 +43,14 @@ async function main() {
   }
   configureCanvas();
   window.addEventListener('resize', configureCanvas);
+
+  // Mouse cursor in normalized device coords [-1, 1]. y is flipped so up is +y.
+  const mouseNdc: [number, number] = [0, 0];
+  canvas.addEventListener('mousemove', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    mouseNdc[0] =  ((e.clientX - rect.left) / rect.width)  * 2 - 1;
+    mouseNdc[1] = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
+  });
 
   // ── Particle storage. Lives entirely on the GPU. ───────────────────
   const particleBuffer = device.createBuffer({
@@ -130,24 +142,40 @@ async function main() {
     ],
   });
 
-  // ── Camera: simple orbit around the origin ─────────────────────────
+  // ── Camera: orbit + cursor unprojection via inverse view ──────────
   const proj = mat4.create();
   const view = mat4.create();
+  const viewInv = mat4.create();
   const vp = mat4.create();
-  function updateViewProj(t: number) {
+  const camPos = vec3.create();
+  const cursorView = vec4.create();
+  const cursorWorld = vec4.create();
+  const mouseWorld = vec3.create();
+
+  // Reused upload buffer for update uniforms. 8 floats = 32 bytes.
+  const uniformsArray = new Float32Array(8);
+
+  function updateCamera(t: number) {
     const aspect = canvas.width / canvas.height || 1;
-    mat4.perspective(proj, Math.PI / 3, aspect, 0.1, 100);
+    const fovY = Math.PI / 3;
     const r = 3.0;
-    mat4.lookAt(
-      view,
-      [r * Math.sin(t * 0.2), 0.6, r * Math.cos(t * 0.2)],
-      [0, 0, 0],
-      [0, 1, 0]
-    );
+
+    vec3.set(camPos, r * Math.sin(t * 0.2), 0.6, r * Math.cos(t * 0.2));
+    mat4.perspective(proj, fovY, aspect, 0.1, 100);
+    mat4.lookAt(view, camPos as Float32Array, [0, 0, 0], [0, 1, 0]);
     mat4.multiply(vp, proj, view);
-    // gl-matrix's mat4 has a loose ArrayBufferLike type; WebGPU wants a non-shared
-    // ArrayBuffer-backed view. The underlying buffer is always plain ArrayBuffer.
     device.queue.writeBuffer(vpUniforms, 0, vp as Float32Array<ArrayBuffer>);
+
+    // Place the cursor in view space (camera at origin, +y up, looking
+    // down -z), then transform through the inverse view matrix to land
+    // it on the focal plane in world space. Reusing the rendering view
+    // matrix means basis signs can't drift from what the camera sees.
+    mat4.invert(viewInv, view);
+    const halfH = Math.tan(fovY / 2) * r;
+    const halfW = halfH * aspect;
+    vec4.set(cursorView, mouseNdc[0] * halfW, mouseNdc[1] * halfH, -r, 1);
+    vec4.transformMat4(cursorWorld, cursorView, viewInv);
+    vec3.set(mouseWorld, cursorWorld[0], cursorWorld[1], cursorWorld[2]);
   }
 
   // ── Frame loop ─────────────────────────────────────────────────────
@@ -161,14 +189,16 @@ async function main() {
     lastTime = now;
     const t = now / 1000;
 
-    // Update uniforms. mouse_world stays (0,0,0,0) until Sunday.
-    device.queue.writeBuffer(
-      updateUniforms,
-      0,
-      new Float32Array([dt, /*gravity*/ 0, /*drag*/ 0, /*_pad*/ 0,
-                        /*mouse_world*/ 0, 0, 0, 0])
-    );
-    updateViewProj(t);
+    updateCamera(t);
+    uniformsArray[0] = dt;
+    uniformsArray[1] = GRAVITY;
+    uniformsArray[2] = DRAG;
+    uniformsArray[3] = 0;
+    uniformsArray[4] = mouseWorld[0];
+    uniformsArray[5] = mouseWorld[1];
+    uniformsArray[6] = mouseWorld[2];
+    uniformsArray[7] = 0;
+    device.queue.writeBuffer(updateUniforms, 0, uniformsArray);
 
     const enc = device.createCommandEncoder();
 

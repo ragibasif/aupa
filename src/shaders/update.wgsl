@@ -25,19 +25,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   var p = particles[i];
 
-  // ── Saturday: pure ballistic drift ────────────────────────────────
-  // Velocity is integrated into position. No forces yet.
-  // ──────────────────────────────────────────────────────────────────
-  //
-  // ── Sunday TODO (your contribution) ───────────────────────────────
-  // Replace the body below with a force model. Suggested shape:
-  //   1. let to_mouse = u.mouse_world.xyz - p.pos.xyz;
-  //   2. compute distance, clamp to avoid singularity at the cursor
-  //   3. accumulate acceleration toward mouse scaled by u.gravity
-  //   4. apply drag: vel *= exp(-u.drag * u.dt)
-  //   5. integrate: vel += accel * dt; pos += vel * dt
-  // ──────────────────────────────────────────────────────────────────
-  p.pos = p.pos + p.vel * u.dt;
+  // Softened-gravity attraction toward the cursor.
+  // r2 = |to_mouse|² + ε. The ε term is the Plummer softening length —
+  // it caps the force as a particle approaches the cursor, so nothing
+  // accelerates to infinity at the singularity. Try halving it for
+  // sharper slingshots, or doubling for a gentler swarm.
+  let to_mouse = u.mouse_world.xyz - p.pos.xyz;
+  let r2 = dot(to_mouse, to_mouse) + 0.01;
+  let dir = to_mouse * inverseSqrt(r2);
+  let accel = dir * (u.gravity / r2);
 
-  particles[i] = p;
+  // Exponential drag — analytically correct for arbitrary dt and drag.
+  let new_vel = p.vel.xyz * exp(-u.drag * u.dt) + accel * u.dt;
+
+  // Symplectic Euler: integrate position with the *new* velocity.
+  // Conserves energy much better than standard Euler — orbits stay stable
+  // instead of slowly spiralling out.
+  let new_pos = p.pos.xyz + new_vel * u.dt;
+
+  particles[i].pos = vec4<f32>(new_pos, 1.0);
+  particles[i].vel = vec4<f32>(new_vel, 0.0);
 }
