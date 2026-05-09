@@ -3,17 +3,22 @@ import initShaderCode from './shaders/init.wgsl?raw';
 import updateShaderCode from './shaders/update.wgsl?raw';
 import renderShaderCode from './shaders/render.wgsl?raw';
 import fadeShaderCode from './shaders/fade.wgsl?raw';
+import bloomShaderCode from './shaders/bloom.wgsl?raw';
+import compositeShaderCode from './shaders/composite.wgsl?raw';
 
 const PARTICLE_COUNT = 1_000_000;
 
 // Live-tunable settings. The UI panel mutates this object in place; the
 // frame loop reads from it every tick, so changes apply on the next frame.
 const config = {
-  gravity: 2.0,       // attraction strength toward the cursor
-  drag: 0.6,          // velocity damping per second (exponential)
-  trailDecay: 0.93,   // motion-trail blend constant (higher = longer trails)
-  boomPeak: 80,       // initial repulsion strength of each black-hole evaporation
-  boomTrigger: 6,     // seconds of "pressure" required before a boom fires
+  gravity: 2.0,        // attraction strength toward the cursor
+  drag: 0.6,           // velocity damping per second (exponential)
+  trailDecay: 0.93,    // motion-trail blend constant (higher = longer trails)
+  boomPeak: 80,        // initial repulsion strength of each black-hole evaporation
+  boomTrigger: 6,      // seconds of "pressure" required before a boom fires
+  particleSize: 0.008, // sprite half-extent in NDC (≈ 8 px on a 1080p canvas)
+  particleGlow: 0.35,  // peak alpha at each sprite's center
+  bloom: 1.0,          // bloom contribution multiplier (0 = off, 1 = standard, 3 = blown out)
 };
 
 // Hard-coded — these aren't worth surfacing in the UI.
@@ -46,29 +51,52 @@ async function main() {
   const ctx = canvas.getContext('webgpu')!;
   const format = navigator.gpu.getPreferredCanvasFormat();
 
-  // Persistent texture that accumulates particle draws across frames —
-  // the fade-and-redraw cycle on this is what produces motion trails.
-  // Recreated on every resize.
+  // Persistent texture that accumulates particle draws across frames.
+  // The composite pass samples this and writes to the swapchain with a
+  // vignette, so the trail needs TEXTURE_BINDING usage.
   let trailTexture!: GPUTexture;
+  // Half-res ping-pong textures for the separable gaussian bloom.
+  let bloomTextureA!: GPUTexture;
+  let bloomTextureB!: GPUTexture;
+  let compositeBindGroup: GPUBindGroup | null = null;
+  let bloomBindGroupH: GPUBindGroup | null = null;
+  let bloomBindGroupV: GPUBindGroup | null = null;
   let trailNeedsInit = true;
 
   function configureCanvas() {
     const dpr = Math.min(window.devicePixelRatio, 2);
     canvas.width = Math.floor(canvas.clientWidth * dpr);
     canvas.height = Math.floor(canvas.clientHeight * dpr);
-    ctx.configure({
-      device,
-      format,
-      alphaMode: 'premultiplied',
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
-    });
+    ctx.configure({ device, format, alphaMode: 'premultiplied' });
     if (trailTexture) trailTexture.destroy();
     trailTexture = device.createTexture({
       label: 'trail',
       size: { width: canvas.width, height: canvas.height },
       format,
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
+    // Bloom textures are half-res — bloom is intrinsically blurry, so
+    // sub-sampling is invisible and saves 4× the fragment work.
+    const bw = Math.max(1, Math.floor(canvas.width / 2));
+    const bh = Math.max(1, Math.floor(canvas.height / 2));
+    if (bloomTextureA) bloomTextureA.destroy();
+    if (bloomTextureB) bloomTextureB.destroy();
+    bloomTextureA = device.createTexture({
+      label: 'bloom-a',
+      size: { width: bw, height: bh },
+      format,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    bloomTextureB = device.createTexture({
+      label: 'bloom-b',
+      size: { width: bw, height: bh },
+      format,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    // Bind groups reference these textures, so all of them are stale.
+    compositeBindGroup = null;
+    bloomBindGroupH = null;
+    bloomBindGroupV = null;
     trailNeedsInit = true;
   }
   configureCanvas();
@@ -102,6 +130,37 @@ async function main() {
     size: 64,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
+
+  // Render config uniforms: { particle_size, particle_glow, _pad, _pad } = 16 bytes
+  const renderConfigUniforms = device.createBuffer({
+    label: 'render-config',
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  const renderConfigArray = new Float32Array(4);
+
+  // Blur uniforms — one per direction. Could be merged with dynamicOffset
+  // but two 16-byte buffers are simpler.
+  const blurUniformsH = device.createBuffer({
+    label: 'blur-h',
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  const blurUniformsV = device.createBuffer({
+    label: 'blur-v',
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  const blurArrayH = new Float32Array(4);
+  const blurArrayV = new Float32Array(4);
+
+  // Composite uniforms: bloom strength + padding.
+  const compositeUniforms = device.createBuffer({
+    label: 'composite-uniforms',
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  const compositeArray = new Float32Array(4);
 
   // ── Init pipeline: one-shot seed of positions/velocities ───────────
   const initPipeline = device.createComputePipeline({
@@ -143,7 +202,8 @@ async function main() {
     ],
   });
 
-  // ── Render pipeline: draws particles as additive points ────────────
+  // ── Render pipeline: draws particles as soft additive sprites ─────
+  // Six vertices per particle (two triangles forming a billboarded quad).
   const renderModule = device.createShaderModule({ code: renderShaderCode });
   const renderPipeline = device.createRenderPipeline({
     label: 'render',
@@ -162,7 +222,7 @@ async function main() {
         },
       ],
     },
-    primitive: { topology: 'point-list' },
+    primitive: { topology: 'triangle-list' },
   });
   const renderBindGroup = device.createBindGroup({
     layout: renderPipeline.getBindGroupLayout(0),
@@ -172,6 +232,7 @@ async function main() {
       // Same uniform buffer the compute pass reads — the renderer pulls
       // the current cycle's color phase and the live boom strength out of it.
       { binding: 2, resource: { buffer: updateUniforms } },
+      { binding: 3, resource: { buffer: renderConfigUniforms } },
     ],
   });
 
@@ -195,6 +256,38 @@ async function main() {
           },
         },
       ],
+    },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  // ── Bloom pipeline: separable 1D gaussian blur, used twice per frame
+  const bloomModule = device.createShaderModule({ code: bloomShaderCode });
+  const blurPipeline = device.createRenderPipeline({
+    label: 'blur',
+    layout: 'auto',
+    vertex: { module: bloomModule, entryPoint: 'vs' },
+    fragment: {
+      module: bloomModule,
+      entryPoint: 'fs',
+      targets: [{ format }],
+    },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  // ── Composite pipeline: samples trail + bloom, vignette, → swapchain
+  const sampler = device.createSampler({
+    magFilter: 'linear',
+    minFilter: 'linear',
+  });
+  const compositeModule = device.createShaderModule({ code: compositeShaderCode });
+  const compositePipeline = device.createRenderPipeline({
+    label: 'composite',
+    layout: 'auto',
+    vertex: { module: compositeModule, entryPoint: 'vs' },
+    fragment: {
+      module: compositeModule,
+      entryPoint: 'fs',
+      targets: [{ format }],
     },
     primitive: { topology: 'triangle-list' },
   });
@@ -249,11 +342,14 @@ async function main() {
       valueLabel.textContent = fmt(v);
     });
   }
-  bindSlider('cfg-gravity',     v => { config.gravity     = v; }, v => v.toFixed(2));
-  bindSlider('cfg-drag',        v => { config.drag        = v; }, v => v.toFixed(2));
-  bindSlider('cfg-trail',       v => { config.trailDecay  = v; }, v => v.toFixed(2));
-  bindSlider('cfg-boompeak',    v => { config.boomPeak    = v; }, v => v.toFixed(0));
-  bindSlider('cfg-boomtrigger', v => { config.boomTrigger = v; }, v => v.toFixed(1));
+  bindSlider('cfg-gravity',      v => { config.gravity      = v; }, v => v.toFixed(2));
+  bindSlider('cfg-drag',         v => { config.drag         = v; }, v => v.toFixed(2));
+  bindSlider('cfg-trail',        v => { config.trailDecay   = v; }, v => v.toFixed(2));
+  bindSlider('cfg-particlesize', v => { config.particleSize = v; }, v => v.toFixed(3));
+  bindSlider('cfg-glow',         v => { config.particleGlow = v; }, v => v.toFixed(2));
+  bindSlider('cfg-bloom',        v => { config.bloom        = v; }, v => v.toFixed(2));
+  bindSlider('cfg-boompeak',     v => { config.boomPeak     = v; }, v => v.toFixed(0));
+  bindSlider('cfg-boomtrigger',  v => { config.boomTrigger  = v; }, v => v.toFixed(1));
 
   // Restart button: re-run the init compute pass to reseed all particle
   // positions and velocities, and clear the trail texture for a fresh start.
@@ -312,6 +408,61 @@ async function main() {
     uniformsArray[7] = boomPhase;
     device.queue.writeBuffer(updateUniforms, 0, uniformsArray);
 
+    renderConfigArray[0] = config.particleSize;
+    renderConfigArray[1] = config.particleGlow;
+    device.queue.writeBuffer(renderConfigUniforms, 0, renderConfigArray);
+
+    // Blur step is 1.5 source pixels per tap; 9 taps gives ±6 px radius.
+    // We compute in source-uv space, so divide by source dimensions:
+    // H blur source is the full-res trail, V blur source is half-res bloomA.
+    const STEP = 1.5;
+    blurArrayH[0] = STEP / canvas.width;
+    blurArrayH[1] = 0;
+    blurArrayH[2] = 1.0;
+    device.queue.writeBuffer(blurUniformsH, 0, blurArrayH);
+
+    blurArrayV[0] = 0;
+    blurArrayV[1] = STEP / Math.max(1, Math.floor(canvas.height / 2));
+    blurArrayV[2] = 1.0;
+    device.queue.writeBuffer(blurUniformsV, 0, blurArrayV);
+
+    compositeArray[0] = config.bloom;
+    device.queue.writeBuffer(compositeUniforms, 0, compositeArray);
+
+    // Lazy-create bind groups whenever they've been invalidated by a
+    // texture resize.
+    if (!bloomBindGroupH) {
+      bloomBindGroupH = device.createBindGroup({
+        layout: blurPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: trailTexture.createView() },
+          { binding: 1, resource: sampler },
+          { binding: 2, resource: { buffer: blurUniformsH } },
+        ],
+      });
+    }
+    if (!bloomBindGroupV) {
+      bloomBindGroupV = device.createBindGroup({
+        layout: blurPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: bloomTextureA.createView() },
+          { binding: 1, resource: sampler },
+          { binding: 2, resource: { buffer: blurUniformsV } },
+        ],
+      });
+    }
+    if (!compositeBindGroup) {
+      compositeBindGroup = device.createBindGroup({
+        layout: compositePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: trailTexture.createView() },
+          { binding: 1, resource: bloomTextureB.createView() },
+          { binding: 2, resource: sampler },
+          { binding: 3, resource: { buffer: compositeUniforms } },
+        ],
+      });
+    }
+
     const enc = device.createCommandEncoder();
 
     // Compute pass: integrate physics on the GPU.
@@ -355,7 +506,8 @@ async function main() {
       pass.end();
     }
 
-    // Particle pass: draw all particles additively over the faded trail.
+    // Particle pass: draw billboarded sprite quads (6 verts per particle)
+    // additively over the faded trail.
     {
       const pass = enc.beginRenderPass({
         colorAttachments: [{
@@ -366,18 +518,60 @@ async function main() {
       });
       pass.setPipeline(renderPipeline);
       pass.setBindGroup(0, renderBindGroup);
-      pass.draw(PARTICLE_COUNT);
+      pass.draw(PARTICLE_COUNT * 6);
       pass.end();
     }
 
-    // Present: copy the accumulated trail texture into this frame's
-    // swapchain image. (Could also be a fullscreen-quad sample for
-    // post-processing; copy is fine when no further work is needed.)
-    enc.copyTextureToTexture(
-      { texture: trailTexture },
-      { texture: ctx.getCurrentTexture() },
-      { width: canvas.width, height: canvas.height, depthOrArrayLayers: 1 },
-    );
+    // Bloom H pass: sample trail, blur horizontally, write to bloom-a
+    // (which is half-res — the linear sampler does the downsampling).
+    {
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{
+          view: bloomTextureA.createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      pass.setPipeline(blurPipeline);
+      pass.setBindGroup(0, bloomBindGroupH);
+      pass.draw(3);
+      pass.end();
+    }
+
+    // Bloom V pass: blur bloom-a vertically into bloom-b. Together with
+    // the H pass, this is a full 2D gaussian via separability.
+    {
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{
+          view: bloomTextureB.createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      pass.setPipeline(blurPipeline);
+      pass.setBindGroup(0, bloomBindGroupV);
+      pass.draw(3);
+      pass.end();
+    }
+
+    // Composite pass: sample trail + blurred bloom, vignette, write to
+    // the swapchain.
+    {
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{
+          view: ctx.getCurrentTexture().createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      pass.setPipeline(compositePipeline);
+      pass.setBindGroup(0, compositeBindGroup);
+      pass.draw(3);
+      pass.end();
+    }
 
     device.queue.submit([enc.finish()]);
 
